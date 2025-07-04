@@ -136,7 +136,7 @@ var nextNatSourceIdx = 1;
 foreach (var network in configSource.Networks)
 {
     var wanIp = (new IpInterface(network.WanIp)).Ip;
-    vyos.Edit("nat source rule", nextNatSourceIdx++);
+    vyos.Edit("nat source rule", nextNatSourceIdx++ * 10);
     vyos.SetObject(new
     {
         Description = $"{network.Name} | Outgoing from {wanIp}",
@@ -162,7 +162,7 @@ foreach (var network in configSource.Networks)
     });
 }
 
-vyos.Edit("nat", "destination", "rule", 1);
+vyos.Edit("nat", "destination", "rule", 10);
 vyos.SetObject(new
 {
     Description =  "exclude wireguard connections",
@@ -187,7 +187,7 @@ foreach (var network in configSource.Networks)
     {
         foreach (var portForward in network.PortForwards)
         {
-            vyos.Edit("nat destination rule", nextNatDestdx++);
+            vyos.Edit("nat destination rule", nextNatDestdx++ * 10);
             var extPort = portForward.ExternalPort;
             var intPort = portForward.InternalPort;
             var size = portForward.Size - 1;
@@ -218,7 +218,7 @@ foreach (var network in configSource.Networks)
         }
     }
     // Generate rule for primary host mapping
-    vyos.Edit("nat destination rule", nextNatDestdx++);
+    vyos.Edit("nat destination rule", nextNatDestdx++ * 10);
     vyos.SetObject(new
     {
         Description = $"{network.Name} | {wanIp} -> {network.LanPrimaryHost}",
@@ -262,11 +262,32 @@ foreach (var network in configSource.Networks)
 // Hairpin setup
 // SNAT
 
+vyos.Edit("nat source rule", nextNatSourceIdx++ * 10);
+vyos.SetObject(new
+{
+    Description = "exclude direct lan conections",
+    Destination = new
+    {
+        Group = new
+        {
+            NetworkGroup =  "all-lan"
+        }
+    },
+    Source = new
+    {
+        Group = new
+        {
+            NetworkGroup =  "all-snat"
+        }
+    },
+    Exclude = true
+});
 foreach (var sourceNetwork in configSource.Networks)
 {
     foreach (var destNetwork in configSource.Networks)
     {
-        vyos.Edit("nat source rule", nextNatSourceIdx++);
+        
+        vyos.Edit("nat source rule", nextNatSourceIdx++ * 10);
         vyos.SetObject(new
         {
             Description = $"{sourceNetwork.Name} | {destNetwork.Name} -> hairpin nat",
@@ -305,7 +326,7 @@ foreach (var sourceNetwork in configSource.Networks)
         {
             foreach (var portForward in destNetwork.PortForwards)
             {
-                vyos.Edit("nat destination rule", nextNatDestdx++);
+                vyos.Edit("nat destination rule", nextNatDestdx++ * 10);
                 var extPort = portForward.ExternalPort;
                 var intPort = portForward.InternalPort;
                 var size = portForward.Size - 1;
@@ -336,7 +357,7 @@ foreach (var sourceNetwork in configSource.Networks)
             }
         }
 
-        vyos.Edit("nat destination rule", nextNatDestdx++);
+        vyos.Edit("nat destination rule", nextNatDestdx++ * 10);
         vyos.SetObject(new
         {
             Description = $"{sourceNetwork.Name} | hairpin nat -> {destNetwork.Name} (1:1 nat catch-all)",
@@ -613,7 +634,7 @@ foreach (var network in configSource.Networks)
                 });
                 vyos.PopEdit();
 
-                vyos.PushEdit($"ipv4 name {sourceToDest} rule 2");
+                vyos.PushEdit($"ipv4 name {sourceToDest} rule 3");
                 vyos.SetObject(new
                 {
                     Destination = new
