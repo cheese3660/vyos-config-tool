@@ -285,12 +285,12 @@ foreach (var sourceNetwork in configSource.Networks)
             {
                 Group = new
                 {
-                    NetworkGroup = $"user-{sourceNetwork.Name}-snat",
+                    NetworkGroup = $"user-{destNetwork.Name}-lan",
                 }
             },
             Translation = new
             {
-                Address = sourceNetwork.WanIp
+                Address = new IpInterface(sourceNetwork.WanIp).Ip
             }
         });
     }
@@ -319,7 +319,7 @@ foreach (var sourceNetwork in configSource.Networks)
                     Description = description,
                     Destination = new
                     {
-                        Address = sourceNetwork.WanIp,
+                        Address = destNetwork.WanIp,
                         Port = $"{extPort}-{extPortEnd}"
                     },
                     Translation = new
@@ -342,7 +342,7 @@ foreach (var sourceNetwork in configSource.Networks)
             Description = $"{sourceNetwork.Name} | hairpin nat -> {destNetwork.Name} (1:1 nat catch-all)",
             Destination = new
             {
-                Address = sourceNetwork.WanIp,
+                Address = destNetwork.WanIp,
             },
             InboundInterface = new
             {
@@ -569,7 +569,8 @@ foreach (var network in configSource.Networks)
         var sourceToDest = $"{sourceZone}-{zone}";
         vyos.Edit("firewall");
         vyos.Set($"zone {zone} from {sourceZone} firewall name {sourceToDest}");
-        vyos.PushEdit($"ipv4 name {sourceToDest} rule 1");
+        vyos.PushEdit($"ipv4 name {sourceToDest}");
+        vyos.PushEdit("rule 1");
         vyos.SetObject(new
         {
             State = new
@@ -577,12 +578,19 @@ foreach (var network in configSource.Networks)
                 Related = true,
                 Established = true,
             },
+            Action = "accept",
+            Description = "allow related/established"
+        });
+        vyos.PopEdit();
+        vyos.PushEdit("rule 2");
+        vyos.SetObject(new
+        {
             ConnectionStatus = new
             {
                 Nat = "destination"
             },
             Action = "accept",
-            Description = "allow related/established"
+            Description = "allow DNATed connections"
         });
     }
 
