@@ -162,6 +162,24 @@ foreach (var network in configSource.Networks)
     });
 }
 
+vyos.Edit("nat source rule", nextNatSourceIdx++ * 10);
+vyos.SetObject(new
+{
+    Description = $"Router | outbound -> public",
+    OutboundInterface = new
+    {
+        Name = configSource.WanInterface
+    },
+    Source = new
+    {
+        Address = new IpInterface(configSource.WanLocalAddr).Ip,
+    },
+    Translation = new
+    {
+        Address = configSource.OutboundWanIp
+    }
+});
+
 vyos.Edit("nat", "destination", "rule", 10);
 vyos.SetObject(new
 {
