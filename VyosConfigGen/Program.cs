@@ -1,5 +1,6 @@
 ﻿// See https://aka.ms/new-console-template for more information
 
+using System.Net;
 using VyosConfigGen;
 using YamlDotNet.Serialization;
 
@@ -7,6 +8,14 @@ var path = args[0];
 var yaml = File.ReadAllText(path);
 var configSource = VyosConfigSource.FromYaml(yaml);
 var vyos = new ConfigBuilder();
+// First lets generate the VRF
+vyos.Delete("vrf name wan");
+vyos.Edit("vrf name wan");
+vyos.Set("table 100");
+var wanLocalAddr = new IpInterface(configSource.WanLocalAddr);
+var wanNetwork = new IpInterface(configSource.WanLocalAddr).Network[1];
+vyos.Set($"protocols static route 0.0.0.0/0 next-hop {wanNetwork}");
+Space();
 
 // Now let's generate the wan interface
 vyos.Edit("interfaces ethernet", configSource.WanInterface);
@@ -18,11 +27,34 @@ vyos.SetObject(new
     Address = configSource.Networks
         .Select(x => x.WanIp)
         .Prepend(configSource.WanLocalAddr)
-        .ToArray()
+        .ToArray(),
+    Vrf = "wan"
 });
 
 Space();
 
+// And the virtual ethernets
+vyos.Edit("interfaces virtual-ethernet veth0");
+vyos.Delete();
+vyos.SetObject(new
+{
+    Address = configSource.VethLocalNet,
+    PeerName = "veth1",
+    Vrf = "wan"
+});
+
+Space();
+vyos.Edit("interfaces virtual-ethernet veth1");
+vyos.Delete();
+vyos.SetObject(new
+{
+    Address = configSource.Networks.Select(x =>
+            new IpInterface(configSource.VethLocalNet).Network[new IpInterface(x.WanIp).Ip.Address & 0xff] + "/24")
+        .ToArray(),
+    PeerName = "veth0",
+});
+
+Space();
 // Now the lan configuration
 vyos.Edit("interfaces ethernet", configSource.LanInterface);
 vyos.Delete("vif");
@@ -78,8 +110,7 @@ Space();
 //  {user}-wg
 // All LANS
 vyos.Edit();
-vyos.Delete("firewall group network-group");
-vyos.Delete("firewall group address-group");
+vyos.Delete("firewall");
 
 vyos.Edit("firewall group network-group");
 vyos.Set("all-lan description \"All LAN networks\"");
@@ -91,19 +122,19 @@ foreach (var network in configSource.Networks)
     var userLan = $"{user}-lan";
     var userSnat = $"{user}-snat";
     var userWg = $"{user}-wg";
-    
-    vyos.Set(user, "description",$"{name} | Access control group".VyosEscape());
+
+    vyos.Set(user, "description", $"{name} | Access control group".VyosEscape());
     vyos.Set(userLan, "description", $"{name} | LAN subnets".VyosEscape());
     vyos.Set(userSnat, "description", $"{name} | SNATed subnets".VyosEscape());
     vyos.Set(userWg, "description", $"{name} | WG peers with access".VyosEscape());
-    
+
     // Setup inherited groups
     vyos.Set(user, "include", userLan);
     vyos.Set(user, "include", userWg);
     vyos.Set(userSnat, "include", userLan);
     vyos.Set("all-lan", "include", userLan);
     vyos.Set("all-snat", "include", userSnat);
-    
+
     // Add lan subnets to lan group
     foreach (var addr in network.LanIps)
     {
@@ -137,23 +168,56 @@ foreach (var network in configSource.Networks)
 {
     var wanIp = (new IpInterface(network.WanIp)).Ip;
     vyos.Edit("nat source rule", nextNatSourceIdx++ * 10);
+    var vrfAddress =
+        new IpInterface(configSource.VethLocalNet).Network[(new IpInterface(network.WanIp).Ip.Address & 0xFF)];
+    foreach (var lanIp in network.LanIps)
+    {
+        vyos.SetObject(new
+        {
+            Description = $"{network.Name} | NAT {lanIp} into WAN VRF",
+            OutboundInterface = new
+            {
+                Name = "veth1"
+            },
+            Source = new
+            {
+                Address = new IpInterface(lanIp).Network.ToString()
+            },
+            Translation = new
+            {
+                Address = vrfAddress
+            }
+        });
+    }
+
+    vyos.Edit("nat source rule", nextNatSourceIdx++ * 10);
     vyos.SetObject(new
     {
-        Description = $"{network.Name} | Outgoing from {wanIp}",
+        Description = $"{network.Name} | NAT from WAN VRF to physical WAN",
         OutboundInterface = new
         {
-            Name = configSource.WanInterface
+            Name = "eth0"
         },
         Source = new
         {
-            Group = new
-            {
-                NetworkGroup =  $"user-{network.Name}-snat"
-            }
+            Address = vrfAddress
         },
-        Destination = new
+        Translation = new
         {
-            Address = "0.0.0.0/0"
+            Address = wanIp
+        }
+    });
+    vyos.Edit("nat source rule", nextNatSourceIdx++ * 10);
+    vyos.SetObject(new
+    {
+        Description = $"{network.Name} | Set source addr for hairpinned connectionss",
+        OutboundInterface = new
+        {
+            Name = "veth0"
+        },
+        Source = new
+        {
+            Address = vrfAddress
         },
         Translation = new
         {
@@ -162,28 +226,28 @@ foreach (var network in configSource.Networks)
     });
 }
 
-vyos.Edit("nat source rule", nextNatSourceIdx++ * 10);
-vyos.SetObject(new
-{
-    Description = $"Router | outbound -> public",
-    OutboundInterface = new
-    {
-        Name = configSource.WanInterface
-    },
-    Source = new
-    {
-        Address = new IpInterface(configSource.WanLocalAddr).Ip,
-    },
-    Translation = new
-    {
-        Address = configSource.OutboundWanIp
-    }
-});
+// vyos.Edit("nat source rule", nextNatSourceIdx++ * 10);
+// vyos.SetObject(new
+// {
+//     Description = $"Router | outbound -> public",
+//     OutboundInterface = new
+//     {
+//         Name = configSource.WanInterface
+//     },
+//     Source = new
+//     {
+//         Address = new IpInterface(configSource.WanLocalAddr).Ip,
+//     },
+//     Translation = new
+//     {
+//         Address = configSource.OutboundWanIp
+//     }
+// });
 
 vyos.Edit("nat", "destination", "rule", 10);
 vyos.SetObject(new
 {
-    Description =  "exclude wireguard connections",
+    Description = "exclude wireguard connections",
     Destination = new
     {
         Address = configSource.Wireguard.EndpointAddr,
@@ -200,6 +264,8 @@ vyos.SetObject(new
 var nextNatDestdx = 2;
 foreach (var network in configSource.Networks)
 {
+    var vrfAddress =
+        new IpInterface(configSource.VethLocalNet).Network[(new IpInterface(network.WanIp).Ip.Address & 0xFF)];
     var wanIp = (new IpInterface(network.WanIp)).Ip;
     if (network.PortForwards != null)
     {
@@ -213,13 +279,13 @@ foreach (var network in configSource.Networks)
             var intPortEnd = intPort + size;
             var description =
                 $"{network.Name} | {wanIp}:{extPort}-{extPortEnd} -> {portForward.ForwardTo}:{intPort}-{intPortEnd}";
-            
+
             vyos.SetObject(new
             {
                 Description = description,
                 Destination = new
                 {
-                    Address = wanIp,
+                    Address = vrfAddress,
                     Port = $"{extPort}-{extPortEnd}"
                 },
                 Translation = new
@@ -229,170 +295,64 @@ foreach (var network in configSource.Networks)
                 },
                 InboundInterface = new
                 {
-                    Name = configSource.WanInterface
+                    Name = "veth1"
                 },
                 Protocol = portForward.Protocol
             });
         }
     }
-    // Generate rule for primary host mapping
+
     vyos.Edit("nat destination rule", nextNatDestdx++ * 10);
     vyos.SetObject(new
     {
-        Description = $"{network.Name} | {wanIp} -> {network.LanPrimaryHost}",
+        Description = $"{network.Name} | wan -> vrf",
         Destination = new
         {
-            Address = wanIp,
+            Address = wanIp
+        },
+        InboundInterface = new
+        {
+            Name = "eth0"
+        },
+        Translation = new
+        {
+            Address = vrfAddress
+        }
+    });
+    vyos.Edit("nat destination rule", nextNatDestdx++ * 10);
+    vyos.SetObject(new
+    {
+        Description = $"{network.Name} | vrf -> primary host",
+        Destination = new
+        {
+            Address = vrfAddress
+        },
+        InboundInterface = new
+        {
+            Name = "veth1"
         },
         Translation = new
         {
             Address = network.LanPrimaryHost
+        }
+    });
+    vyos.Edit("nat destination rule", nextNatDestdx++ * 10);
+    vyos.SetObject(new
+    {
+        Description = $"{network.Name} | vrf wan -> vrf",
+        Destination = new
+        {
+            Address = wanIp
         },
         InboundInterface = new
         {
-            Name = configSource.WanInterface
+            Name = "veth0"
+        },
+        Translation = new
+        {
+            Address = vrfAddress
         }
     });
-    
-    // // Hairpin
-    // foreach (var sourceNetwork in configSource.Networks)
-    // {
-    //     vyos.Edit("nat destination rule", nextNatDestdx++);
-    //     vyos.SetObject(new
-    //     {
-    //         Description = $"{network.Name} | hairpin nat -> {sourceNetwork.Name}",
-    //         Destination = new
-    //         {
-    //             Address = network.WanIp,
-    //         },
-    //         Translation = new
-    //         {
-    //             Address = network.LanPrimaryHost
-    //         },
-    //         InboundInterface = new
-    //         {
-    //             Name = $"{configSource.LanInterface}.{network.LanVlan}"
-    //         }
-    //     });
-    // }
-}
-
-// Hairpin setup
-// SNAT
-
-vyos.Edit("nat source rule", nextNatSourceIdx++ * 10);
-vyos.SetObject(new
-{
-    Description = "exclude direct lan conections",
-    Destination = new
-    {
-        Group = new
-        {
-            NetworkGroup =  "all-lan"
-        }
-    },
-    Source = new
-    {
-        Group = new
-        {
-            NetworkGroup =  "all-snat"
-        }
-    },
-    Exclude = true
-});
-foreach (var sourceNetwork in configSource.Networks)
-{
-    foreach (var destNetwork in configSource.Networks)
-    {
-        
-        vyos.Edit("nat source rule", nextNatSourceIdx++ * 10);
-        vyos.SetObject(new
-        {
-            Description = $"{sourceNetwork.Name} | {destNetwork.Name} -> hairpin nat",
-            OutboundInterface = new
-            {
-                Name = $"{configSource.LanInterface}.{destNetwork.LanVlan}",
-            },
-            Source = new
-            {
-                Group = new
-                {
-                    NetworkGroup = $"user-{sourceNetwork.Name}-snat",
-                }
-            },
-            Destination = new
-            {
-                Group = new
-                {
-                    NetworkGroup = $"user-{destNetwork.Name}-lan",
-                }
-            },
-            Translation = new
-            {
-                Address = new IpInterface(sourceNetwork.WanIp).Ip
-            }
-        });
-    }
-}
-
-// DNAT
-foreach (var sourceNetwork in configSource.Networks)
-{
-    foreach (var destNetwork in configSource.Networks)
-    {
-        if (destNetwork.PortForwards != null)
-        {
-            foreach (var portForward in destNetwork.PortForwards)
-            {
-                vyos.Edit("nat destination rule", nextNatDestdx++ * 10);
-                var extPort = portForward.ExternalPort;
-                var intPort = portForward.InternalPort;
-                var size = portForward.Size - 1;
-                var extPortEnd = extPort + size;
-                var intPortEnd = intPort + size;
-                var description =
-                    $"{sourceNetwork.Name} | hairpin nat -> {destNetwork.Name} (port forward {extPort}-{extPortEnd}/{portForward.Protocol})";
-            
-                vyos.SetObject(new
-                {
-                    Description = description,
-                    Destination = new
-                    {
-                        Address = destNetwork.WanIp,
-                        Port = $"{extPort}-{extPortEnd}"
-                    },
-                    Translation = new
-                    {
-                        Address = portForward.ForwardTo,
-                        Port = $"{intPort}-{intPortEnd}"
-                    },
-                    InboundInterface = new
-                    {
-                        Name = $"{configSource.LanInterface}.{sourceNetwork.LanVlan}"
-                    },
-                    Protocol = portForward.Protocol
-                });
-            }
-        }
-
-        vyos.Edit("nat destination rule", nextNatDestdx++ * 10);
-        vyos.SetObject(new
-        {
-            Description = $"{sourceNetwork.Name} | hairpin nat -> {destNetwork.Name} (1:1 nat catch-all)",
-            Destination = new
-            {
-                Address = destNetwork.WanIp,
-            },
-            InboundInterface = new
-            {
-                Name = $"{configSource.LanInterface}.{sourceNetwork.LanVlan}"
-            },
-            Translation = new
-            {
-                Address = destNetwork.LanPrimaryHost
-            }
-        });
-    }
 }
 
 Space();
@@ -444,35 +404,13 @@ Space();
 
 // TODO: DNS Server?
 
-// Firewall stuff
-vyos.Edit("firewall");
 
-vyos.Delete("ipv4");
-vyos.Delete("zone");
-vyos.Set("zone WAN member interface", configSource.WanInterface);
-vyos.Set("zone LOCAL local-zone");
-
-// Traffic to/from the router and wan
-vyos.Edit("firewall");
-vyos.Set("zone WAN from LOCAL firewall name LOCAL-WAN");
-vyos.Set("zone LOCAL from WAN firewall name WAN-LOCAL");
-vyos.PushEdit("ipv4 name");
-vyos.Set("LOCAL-WAN default-action accept");
-vyos.PushEdit("WAN-LOCAL");
-vyos.Set("default-action drop");
-vyos.PushEdit("rule 1");
-vyos.SetObject(new
-{
-    Action = "accept",
-    Destination = new
-    {
-        Address = configSource.Wireguard.EndpointAddr,
-        Port = 51820
-    },
-    Protocol = "udp"
-});
-vyos.PopEdit();
-vyos.PushEdit("rule 2");
+vyos.Edit();
+var nextForwardRule = 1;
+// Deny all from the forward filter
+vyos.Comment("Deny all from the forward filter");
+vyos.Set("firewall ipv4 forward filter default-action drop");
+vyos.Edit("firewall ipv4 forward filter rule", nextForwardRule++ * 10);
 vyos.SetObject(new
 {
     Description = "allow related/established",
@@ -484,34 +422,51 @@ vyos.SetObject(new
     }
 });
 
-// FW zones for vanguard
-vyos.Edit("firewall");
-vyos.PushEdit("zone");
-vyos.Set("WIREGUARD member interface wg0");
-vyos.Set("LOCAL from WIREGUARD firewall name WIREGUARD-LOCAL");
-vyos.Set("WIREGUARD from LOCAL firewall name LOCAL-WIREGUARD");
-vyos.Set("WAN from WIREGUARD firewall name WIREGUARD-WAN");
-vyos.Set("WIREGUARD from WAN firewall name WAN-WIREGUARD");
-vyos.PopEdit();
-vyos.PushEdit("ipv4 name");
-vyos.Set("LOCAL-WIREGUARD default-action accept");
-vyos.Set("WIREGUARD-LOCAL default-action accept");
-vyos.PushEdit("WAN-WIREGUARD rule 1");
+vyos.Edit("firewall ipv4 forward filter rule", nextForwardRule++ * 10);
 vyos.SetObject(new
 {
-    Description = "allow related/established",
-    State = new
+    Description = "Allow VRF -> WAN",
+    Action = "accept",
+    Source = new
     {
-        Related = true,
-        Established = true,
+        Address = new IpInterface(configSource.VethLocalNet).Network.NetworkAddress + "/24", 
     },
-    Action = "accept"
+    Destination = new
+    {
+        Address = "0.0.0.0/0"
+    }
 });
-vyos.PopEdit();
-vyos.PushEdit("WIREGUARD-WAN rule 1");
-vyos.SetObject( new {
+
+vyos.Edit("firewall ipv4 forward filter rule", nextForwardRule++ * 10);
+vyos.SetObject(new
+{
+    Action = "accept",
+    Destination = new
+    {
+        Address = configSource.Wireguard.EndpointAddr,
+        Port = 51820
+    },
+    Protocol = "udp",
+});
+
+vyos.Edit("firewall ipv4 forward filter rule", nextForwardRule++ * 10);
+vyos.SetObject(new
+{
+    Description = "Jump connections to wireguard into their own ruleset",
+    Source = new
+    {
+        Address = new IpInterface(configSource.Wireguard.Address).Network.ToString(),
+    },
+    Action = "jump",
+    JumpTarget = "WIREGUARD-WAN",
+});
+
+vyos.Edit("firewall ipv4 name WIREGUARD-WAN rule 1");
+vyos.SetObject(new
+{
     Description = "allow SNATed connections",
-    Source = new {
+    Source = new
+    {
         Group = new
         {
             NetworkGroup = "all-snat"
@@ -523,56 +478,55 @@ vyos.SetObject( new {
 foreach (var network in configSource.Networks)
 {
     var name = network.Name;
+    var lanNetwork = $"user-{name}-lan";
     var zone = $"USER_{name}";
     var zoneToWan = $"{zone}-WAN";
-    var wanToZone = $"WAN-{zone}";
     var zoneToWireGuard = $"{zone}-WIREGUARD";
-    var wireGuardToZone = $"WIREGUARD-{zone}";
-
-    vyos.Edit("firewall");
-    vyos.Set($"zone {zone} member interface {configSource.LanInterface}.{network.LanVlan}");
-    vyos.Set($"zone WAN from {zone} firewall name {zoneToWan}");
-    vyos.Set($"zone {zone} from WAN firewall name {wanToZone}");
-
-    vyos.PushEdit("ipv4 name");
-    vyos.PushEdit(zoneToWan);
-    vyos.SetObject(new
-    {
-        Description = $"{name} | allow all connections to internet",
-        DefaultAction = "accept",
-    });
-    vyos.PopEdit();
-    vyos.PushEdit(wanToZone);
-    vyos.Set("description", $"{name} | internet to local".VyosEscape());
-    vyos.PushEdit("rule 1");
-    vyos.SetObject(new
-    {
-        Description = "allow related/established",
-        State = new
-        {
-            Related = true,
-            Established = true,
-        },
-        Action = "accept"
-    });
-    vyos.PopEdit();
-    vyos.PushEdit("rule 2");
-    vyos.SetObject(new
-    {
-        Description = "allow DNATed connections",
-        ConnectionStatus = new
-        {
-            Nat = "destination"
-        },
-        Action = "accept"
-    });
+    var wireguardToZone = $"WIREGUARD-{zone}";
     
-    vyos.Edit("firewall");
-    vyos.Set($"zone {zone} from WIREGUARD firewall name {wireGuardToZone}");
-    vyos.Set($"zone WIREGUARD from {zone} firewall name {zoneToWireGuard}");
+    // Then zone to wireguard
+    vyos.Edit("firewall ipv4 forward filter rule", nextForwardRule++ * 10);
+    vyos.SetObject(new
+    {
+        Description = $"Zone policy for {zoneToWireGuard}",
+        Source = new
+        {
+            Group = new
+            {
+                NetworkGroup = lanNetwork,
+            }
+        },
+        Destination = new
+        {
+            Address = new IpInterface(configSource.Wireguard.Address).Network.ToString(),
+        },
+        Action = "jump",
+        JumpTarget = zoneToWireGuard,
+    });
+
+    vyos.Edit($"firewall ipv4 name {zoneToWireGuard}");
+    vyos.Set("default-action drop");
     
-    vyos.PushEdit("ipv4 name");
-    vyos.PushEdit(wireGuardToZone);
+    vyos.Edit("firewall ipv4 forward filter rule", nextForwardRule++ * 10);
+    vyos.SetObject(new
+    {
+        Description = $"Zone policy for {wireguardToZone}",
+        Destination = new
+        {
+            Group = new
+            {
+                NetworkGroup = lanNetwork,
+            }
+        },
+        Source = new
+        {
+            Address = new IpInterface(configSource.Wireguard.Address).Network.ToString(),
+        },
+        Action = "jump",
+        JumpTarget = wireguardToZone,
+    });
+
+    vyos.Edit($"firewall ipv4 name {wireguardToZone}");
     vyos.Set("default-action drop");
     vyos.PushEdit("rule 1");
     vyos.SetObject(new
@@ -586,52 +540,6 @@ foreach (var network in configSource.Networks)
         },
         Action = "accept"
     });
-    vyos.PopEdit();
-    vyos.PopEdit();
-    vyos.PushEdit(zoneToWireGuard);
-    vyos.Set("default-action drop");
-    vyos.PushEdit("rule 1");
-    vyos.SetObject(new
-    {
-        State = new
-        {
-            Related = true,
-            Established = true,
-        },
-        Action = "accept"
-    });
-
-    foreach (var source in configSource.Networks.Where(x => x != network))
-    {
-        var sourceName = source.Name;
-        var sourceZone = $"USER_{sourceName}";
-        var sourceToDest = $"{sourceZone}-{zone}";
-        vyos.Edit("firewall");
-        vyos.Set($"zone {zone} from {sourceZone} firewall name {sourceToDest}");
-        vyos.PushEdit($"ipv4 name {sourceToDest}");
-        vyos.PushEdit("rule 1");
-        vyos.SetObject(new
-        {
-            State = new
-            {
-                Related = true,
-                Established = true,
-            },
-            Action = "accept",
-            Description = "allow related/established"
-        });
-        vyos.PopEdit();
-        vyos.PushEdit("rule 2");
-        vyos.SetObject(new
-        {
-            ConnectionStatus = new
-            {
-                Nat = "destination"
-            },
-            Action = "accept",
-            Description = "allow DNATed connections"
-        });
-    }
 
     if (network.AllowFrom != null)
     {
@@ -640,6 +548,29 @@ foreach (var network in configSource.Networks)
             var sourceName = source.NetworkName;
             var sourceZone = $"USER_{sourceName}";
             var sourceToDest = $"{sourceZone}-{zone}";
+            vyos.Edit("firewall ipv4 forward filter rule", nextForwardRule++ * 10);
+            vyos.SetObject(new
+            {
+                Description = $"Zone policy for {sourceToDest}",
+                Destination = new
+                {
+                    Group = new
+                    {
+                        NetworkGroup = lanNetwork,
+                    }
+                },
+                Source = new
+                {
+                    Group = new
+                    {
+                        NetworkGroup = $"user-{sourceName}-lan"
+                    }
+                },
+                Action = "jump",
+                JumpTarget = sourceToDest,
+            });
+
+            
             vyos.Edit("firewall");
             if (source.ToHosts != null)
             {
@@ -652,7 +583,7 @@ foreach (var network in configSource.Networks)
                 });
                 vyos.PopEdit();
 
-                vyos.PushEdit($"ipv4 name {sourceToDest} rule 3");
+                vyos.PushEdit($"ipv4 name {sourceToDest} rule 1");
                 vyos.SetObject(new
                 {
                     Destination = new
@@ -673,6 +604,152 @@ foreach (var network in configSource.Networks)
         }
     }
 }
+
+foreach (var network in configSource.Networks)
+{
+    
+    var name = network.Name;
+    var lanNetwork = $"user-{name}-lan";
+    var zone = $"USER_{name}";
+    var zoneToWan = $"{zone}-WAN";
+    var wanToZone = $"WAN-{zone}";
+    var zoneToWireGuard = $"{zone}-WIREGUARD";
+    var wireguardToZone = $"WIREGUARD-{zone}";
+    // Do the lan -> wan as late as possible as well
+    vyos.Edit("firewall ipv4 forward filter rule", nextForwardRule++ * 10);
+    vyos.SetObject(new
+    {
+        Description = $"Zone policy for {zoneToWan}",
+        Source = new
+        {
+            Group = new
+            {
+                NetworkGroup = lanNetwork,
+            }
+        },
+        Destination = new
+        {
+            Address = "0.0.0.0/0"
+        },
+        Action = "jump",
+        JumpTarget = zoneToWan,
+    });
+    vyos.Edit($"firewall ipv4 name {zoneToWan}");
+    vyos.SetObject(new
+    {
+        Description = $"{name} | allow all connections to internet",
+        DefaultAction = "accept",
+    });
+    // Do the wan to lan as late as possible
+    vyos.Edit("firewall ipv4 forward filter rule", nextForwardRule++ * 10);
+    vyos.SetObject(new
+    {
+        Description = $"Zone policy for {wanToZone}",
+        Destination = new
+        {
+            Group = new
+            {
+                NetworkGroup = lanNetwork,
+            }
+        },
+        Source = new
+        {
+            Address = "0.0.0.0/0"
+        },
+        Action = "jump",
+        JumpTarget = wanToZone,
+    });
+    
+    vyos.Edit($"firewall ipv4 name {wanToZone}");
+    vyos.Set("description", $"{name} | internet to local".VyosEscape());
+    vyos.PushEdit("rule 1");
+    vyos.SetObject(new
+    {
+        Description = "allow DNATed connections",
+        ConnectionStatus = new
+        {
+            Nat = "destination"
+        },
+        Action = "accept",
+    });
+}
+
+//
+// foreach (var network in configSource.Networks)
+// {
+//
+//     // foreach (var source in configSource.Networks.Where(x => x != network))
+//     // {
+//     //     var sourceName = source.Name;
+//     //     var sourceZone = $"USER_{sourceName}";
+//     //     var sourceToDest = $"{sourceZone}-{zone}";
+//     //     vyos.Edit("firewall");
+//     //     vyos.Set($"zone {zone} from {sourceZone} firewall name {sourceToDest}");
+//     //     vyos.PushEdit($"ipv4 name {sourceToDest}");
+//     //     vyos.PushEdit("rule 1");
+//     //     vyos.SetObject(new
+//     //     {
+//     //         State = new
+//     //         {
+//     //             Related = true,
+//     //             Established = true,
+//     //         },
+//     //         Action = "accept",
+//     //         Description = "allow related/established"
+//     //     });
+//     //     vyos.PopEdit();
+//     //     vyos.PushEdit("rule 2");
+//     //     vyos.SetObject(new
+//     //     {
+//     //         ConnectionStatus = new
+//     //         {
+//     //             Nat = "destination"
+//     //         },
+//     //         Action = "accept",
+//     //         Description = "allow DNATed connections"
+//     //     });
+//     // }
+//     //
+//     // if (network.AllowFrom != null)
+//     // {
+//     //     foreach (var source in network.AllowFrom)
+//     //     {
+//     //         var sourceName = source.NetworkName;
+//     //         var sourceZone = $"USER_{sourceName}";
+//     //         var sourceToDest = $"{sourceZone}-{zone}";
+//     //         vyos.Edit("firewall");
+//     //         if (source.ToHosts != null)
+//     //         {
+//     //             var addrGroupName = $"{sourceName}-to-{name}-allowed-dests";
+//     //             vyos.PushEdit($"group address-group {addrGroupName}");
+//     //             vyos.SetObject(new
+//     //             {
+//     //                 Description = $"{name} | hosts that network {sourceName} is allowed to connect to",
+//     //                 Address = source.ToHosts.ToArray(),
+//     //             });
+//     //             vyos.PopEdit();
+//     //
+//     //             vyos.PushEdit($"ipv4 name {sourceToDest} rule 3");
+//     //             vyos.SetObject(new
+//     //             {
+//     //                 Destination = new
+//     //                 {
+//     //                     Group = new
+//     //                     {
+//     //                         AddressGroup = addrGroupName,
+//     //                     }
+//     //                 },
+//     //                 Action = "accept",
+//     //                 Description = $"allow connections to addr group {addrGroupName}"
+//     //             });
+//     //         }
+//     //         else
+//     //         {
+//     //             vyos.Set($"ipv4 name {sourceToDest} default-action accept");
+//     //         }
+//     //     }
+//     // }
+// }
 
 return;
 

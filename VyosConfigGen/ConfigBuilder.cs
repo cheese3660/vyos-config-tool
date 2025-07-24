@@ -80,4 +80,9 @@ public class ConfigBuilder
     {
         Console.WriteLine($"delete {string.Join(" ", CurrentlyBeingEdited.Concat(args))}");
     }
+
+    public void Comment(string comment)
+    {
+        Console.WriteLine($"# {comment}");
+    }
 }

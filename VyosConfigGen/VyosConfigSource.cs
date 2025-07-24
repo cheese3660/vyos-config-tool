@@ -8,6 +8,7 @@ public class VyosConfigSource
     public string WanInterface { get; set; }
     public string LanInterface { get; set; }
     public string WanLocalAddr { get; set; }
+    public string VethLocalNet { get; set; }
     public string OutboundWanIp { get; set; }
     public List<NetworkDescription> Networks { get; set; } = [];
     public Wireguard Wireguard { get; set; }
